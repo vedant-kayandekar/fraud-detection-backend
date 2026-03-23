@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: fraudguard-api
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+    disk:
+      name: model-cache
+      mountPath: /opt/render/project/src/model_cache
+      sizeGB: 1
