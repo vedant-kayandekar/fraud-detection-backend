@@ -1,21 +1,22 @@
 """
 ML Model Module for FraudGuard Pipeline.
 
-Multi-model fraud detection system:
-  Stage 1: IsolationForest generates pseudo-labels (unsupervised)
-  Stage 2: 4 models trained on pseudo-labels, auto-select best F1
-  Stage 3: RandomizedSearchCV hyperparameter tuning on best model
-  Stage 4: SHAP explainability on best model
+Two-track parallel architecture:
+  Track A (fast): IsolationForest → XGBoost → SHAP → dashboard (~15s)
+  Track B (background): RF, LR, DT trained in parallel via threads → comparison table via polling
 """
 
+import time
 import logging
+import threading
 import numpy as np
 import pandas as pd
 from typing import Dict, Any, List, Optional
+from concurrent.futures import ThreadPoolExecutor
 from sklearn.ensemble import IsolationForest, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.tree import DecisionTreeClassifier
-from sklearn.model_selection import train_test_split, RandomizedSearchCV
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     precision_score, recall_score, f1_score,
     accuracy_score, roc_auc_score
@@ -41,7 +42,6 @@ MODEL_FEATURES = [
     'is_new_device_prefix', 'is_cnp_device', 'device_is_new_for_user',
     'user_txn_velocity_1hr', 'user_txn_velocity_24hr',
     'is_failed_high_amount', 'device_multi_user',
-    # 5 combined features from improvement pass
     'risk_score_composite', 'amount_balance_ratio',
     'user_city_consistency', 'velocity_amount_product', 'night_high_spend',
 ]
@@ -53,80 +53,84 @@ WHY_USED = {
     "Decision Tree": "Single tree with explicit if-then rules. Fully transparent but prone to overfitting on noisy data.",
 }
 
-PARAM_DISTRIBUTIONS = {
-    "XGBoost": {
-        "n_estimators": [100, 200, 300, 400],
-        "max_depth": [3, 4, 5, 6],
-        "learning_rate": [0.05, 0.1, 0.15, 0.2],
-        "subsample": [0.8, 0.9, 1.0],
-        "colsample_bytree": [0.8, 0.9, 1.0],
-    },
-    "Random Forest": {
-        "n_estimators": [100, 200, 300],
-        "max_depth": [4, 6, 8, None],
-        "min_samples_split": [2, 5, 10],
-        "min_samples_leaf": [1, 2, 4],
-    },
-}
+# In-memory job store for background comparison results
+job_store: Dict[str, Dict[str, Any]] = {}
 
 
-def _build_models(scale_pos_weight: float) -> Dict[str, Any]:
+def run_single_model(
+    model_name: str,
+    model_instance,
+    X_train: np.ndarray,
+    X_test: np.ndarray,
+    y_train: np.ndarray,
+    y_test: np.ndarray,
+    results_dict: dict,
+) -> None:
     """
-    Build the 4 model instances with appropriate class weights.
+    Train one model and store its metrics in results_dict.
+    Thread-safe — each thread writes to a unique key.
 
     Args:
-        scale_pos_weight: Ratio of non-fraud to fraud for class balancing.
-
-    Returns:
-        Dict mapping model name to sklearn estimator.
+        model_name: Name of the model.
+        model_instance: Sklearn-compatible estimator.
+        X_train, X_test, y_train, y_test: Split data.
+        results_dict: Shared dict to write results into.
     """
-    import xgboost as xgb
+    try:
+        start = time.time()
+        model_instance.fit(X_train, y_train)
+        y_pred = model_instance.predict(X_test)
 
-    return {
-        "XGBoost": xgb.XGBClassifier(
-            n_estimators=200,
-            max_depth=4,
-            learning_rate=0.1,
-            scale_pos_weight=scale_pos_weight,
-            use_label_encoder=False,
-            eval_metric='logloss',
-            random_state=42,
-            n_jobs=-1,
-        ),
-        "Random Forest": RandomForestClassifier(
-            n_estimators=200,
-            max_depth=6,
-            class_weight='balanced',
-            random_state=42,
-            n_jobs=-1,
-        ),
-        "Logistic Regression": LogisticRegression(
-            class_weight='balanced',
-            max_iter=1000,
-            random_state=42,
-        ),
-        "Decision Tree": DecisionTreeClassifier(
-            max_depth=5,
-            class_weight='balanced',
-            random_state=42,
-        ),
-    }
+        if hasattr(model_instance, 'predict_proba'):
+            y_proba = model_instance.predict_proba(X_test)[:, 1]
+        else:
+            y_proba = y_pred.astype(float)
+
+        try:
+            auc = float(roc_auc_score(y_test, y_proba))
+        except ValueError:
+            auc = 0.0
+
+        results_dict[model_name] = {
+            "model_name": model_name,
+            "accuracy": round(float(accuracy_score(y_test, y_pred)), 4),
+            "precision": round(float(precision_score(y_test, y_pred, zero_division=0)), 4),
+            "recall": round(float(recall_score(y_test, y_pred, zero_division=0)), 4),
+            "f1_score": round(float(f1_score(y_test, y_pred, zero_division=0)), 4),
+            "roc_auc": round(auc, 4),
+            "training_time_seconds": round(time.time() - start, 2),
+            "is_best": False,
+            "why_used": WHY_USED.get(model_name, ""),
+            "status": "complete",
+        }
+        logger.info(f"  {model_name} done in {results_dict[model_name]['training_time_seconds']}s "
+                     f"(F1={results_dict[model_name]['f1_score']})")
+    except Exception as e:
+        logger.warning(f"  {model_name} failed: {e}")
+        results_dict[model_name] = {
+            "model_name": model_name,
+            "accuracy": 0.0, "precision": 0.0, "recall": 0.0,
+            "f1_score": 0.0, "roc_auc": 0.0,
+            "training_time_seconds": 0.0,
+            "is_best": False,
+            "why_used": WHY_USED.get(model_name, ""),
+            "status": "failed",
+            "error": str(e),
+        }
 
 
 class FraudDetector:
     """
-    Multi-model fraud detector.
+    Two-track parallel fraud detector.
 
-    Stage 1: IsolationForest pseudo-labels.
-    Stage 2: 4 models trained and compared on pseudo-labels.
-    Stage 3: Best F1 model selected + optional hyperparameter tuning.
-    Stage 4: SHAP explainability on best model.
+    Track A: IsolationForest → XGBoost → SHAP → dashboard (fast path).
+    Track B: RF, LR, DT in background threads → comparison via polling.
     """
 
     def __init__(self):
-        """Initialize FraudDetector with no trained models."""
+        """Initialize FraudDetector."""
         self.best_model = None
-        self.best_model_name: str = ""
+        self.best_model_name: str = "XGBoost"
         self.iso_model = None
         self.feature_importance: Dict[str, float] = {}
         self.last_df_features: Optional[pd.DataFrame] = None
@@ -146,33 +150,34 @@ class FraudDetector:
         """
         available = [f for f in feature_list if f in df.columns]
         X = df[available].copy()
-        # Convert category columns to numeric codes for sklearn
         for col in X.select_dtypes(include=['category']).columns:
             X[col] = X[col].cat.codes
         X = X.fillna(0).replace([np.inf, -np.inf], 0)
-        # Ensure all float for model compatibility
         for col in X.columns:
             if X[col].dtype == 'float16':
                 X[col] = X[col].astype('float32')
         return X
 
-    def detect(self, df: pd.DataFrame) -> Dict[str, Any]:
+    def detect(self, df: pd.DataFrame, job_id: str) -> Dict[str, Any]:
         """
-        Run the full multi-model fraud detection pipeline.
+        Run two-track fraud detection pipeline.
+
+        Track A: XGBoost fast path — blocks, returns dashboard payload.
+        Track B: Other 3 models — launched in background threads.
 
         Args:
-            df: DataFrame with all engineered features (from FeatureEngineer).
+            df: DataFrame with all engineered features.
+            job_id: Unique job identifier for background comparison polling.
 
         Returns:
-            Dict with fraud_count, fraud_rate, total_processed,
-            model_comparison list, best_model_name, best_model_f1,
-            tuned_model_metrics, fraud_rows, feature_importance, shap_summary.
+            Dict with fraud_count, fraud_rate, fraud_rows, feature_importance,
+            shap_summary, model_comparison (XGBoost only initially), job_id.
         """
         self.last_df_features = df.copy()
         X_iso = self._prepare_features(df, IF_FEATURES)
 
-        # ── Stage 1: Isolation Forest ──
-        logger.info("Stage 1: Running IsolationForest for pseudo-labels...")
+        # ── Step 1: Isolation Forest — runs once, shared by both tracks ──
+        logger.info("Step 1: Running IsolationForest for pseudo-labels...")
         self.iso_model = IsolationForest(
             contamination=0.08,
             random_state=42,
@@ -182,8 +187,6 @@ class FraudDetector:
         iso_labels = self.iso_model.fit_predict(X_iso)
         df['pseudo_fraud'] = (iso_labels == -1).astype(int)
 
-        # ── Stage 2: Train & compare 4 models ──
-        logger.info("Stage 2: Training and comparing 4 models...")
         X_all = self._prepare_features(df, MODEL_FEATURES)
         y = df['pseudo_fraud']
         feat_names = X_all.columns.tolist()
@@ -198,124 +201,43 @@ class FraudDetector:
         self._X_train = X_train
         self._y_train = y_train
 
-        models = _build_models(scale_pos)
-        model_comparison = []
-        trained_models = {}
-        best_f1 = -1.0
-        best_name = ""
+        X_train_np = X_train.values
+        X_test_np = X_test.values
+        y_train_np = y_train.values
+        y_test_np = y_test.values
 
-        for name, model in models.items():
-            try:
-                logger.info(f"  Training {name}...")
-                model.fit(X_train, y_train)
-                y_pred = model.predict(X_test)
-                y_proba = model.predict_proba(X_test)[:, 1] if hasattr(model, 'predict_proba') else y_pred.astype(float)
+        # ══════════════════════════════════════════════════════════════
+        # Track A: XGBoost FAST PATH — runs immediately, blocks
+        # ══════════════════════════════════════════════════════════════
+        logger.info("Track A: Training XGBoost (fast path)...")
+        import xgboost as xgb
 
-                acc = float(accuracy_score(y_test, y_pred))
-                prec = float(precision_score(y_test, y_pred, zero_division=0))
-                rec = float(recall_score(y_test, y_pred, zero_division=0))
-                f1 = float(f1_score(y_test, y_pred, zero_division=0))
-                try:
-                    auc = float(roc_auc_score(y_test, y_proba))
-                except ValueError:
-                    auc = 0.0
+        xgb_model = xgb.XGBClassifier(
+            n_estimators=200,
+            max_depth=4,
+            learning_rate=0.1,
+            scale_pos_weight=scale_pos,
+            use_label_encoder=False,
+            eval_metric='logloss',
+            random_state=42,
+            n_jobs=-1,
+        )
 
-                trained_models[name] = model
-                entry = {
-                    "model_name": name,
-                    "accuracy": round(acc, 4),
-                    "precision": round(prec, 4),
-                    "recall": round(rec, 4),
-                    "f1_score": round(f1, 4),
-                    "roc_auc": round(auc, 4),
-                    "is_best": False,
-                    "why_used": WHY_USED.get(name, ""),
-                }
-                model_comparison.append(entry)
+        track_a_results = {}
+        run_single_model("XGBoost", xgb_model, X_train_np, X_test_np,
+                         y_train_np, y_test_np, track_a_results)
 
-                if f1 > best_f1:
-                    best_f1 = f1
-                    best_name = name
+        self.best_model = xgb_model
+        self.best_model_name = "XGBoost"
 
-            except Exception as e:
-                logger.warning(f"  {name} training failed: {e}")
-                model_comparison.append({
-                    "model_name": name,
-                    "accuracy": 0.0, "precision": 0.0, "recall": 0.0,
-                    "f1_score": 0.0, "roc_auc": 0.0,
-                    "is_best": False,
-                    "why_used": WHY_USED.get(name, ""),
-                })
-
-        # Mark best model
-        for entry in model_comparison:
-            if entry["model_name"] == best_name:
-                entry["is_best"] = True
-
-        self.best_model = trained_models.get(best_name)
-        self.best_model_name = best_name
-        logger.info(f"  Best model: {best_name} (F1={best_f1:.4f})")
-
-        # ── Stage 3: Hyperparameter tuning on best model ──
-        tuned_metrics = None
-        f1_before = best_f1
-        if best_name in PARAM_DISTRIBUTIONS and self.best_model is not None:
-            try:
-                logger.info(f"Stage 3: Tuning {best_name} with RandomizedSearchCV...")
-                tuner = RandomizedSearchCV(
-                    self.best_model,
-                    PARAM_DISTRIBUTIONS[best_name],
-                    n_iter=20,
-                    cv=5,
-                    scoring='f1',
-                    random_state=42,
-                    n_jobs=-1,
-                )
-                tuner.fit(X_train, y_train)
-                self.best_model = tuner.best_estimator_
-                trained_models[best_name] = self.best_model
-
-                # Re-evaluate tuned model
-                y_pred_tuned = self.best_model.predict(X_test)
-                f1_after = float(f1_score(y_test, y_pred_tuned, zero_division=0))
-
-                tuned_metrics = {
-                    "f1_before_tuning": round(f1_before, 4),
-                    "f1_after_tuning": round(f1_after, 4),
-                    "improvement": round(f1_after - f1_before, 4),
-                    "best_params": {k: (v if not isinstance(v, (np.integer, np.floating)) else
-                                        int(v) if isinstance(v, np.integer) else float(v))
-                                    for k, v in tuner.best_params_.items()},
-                }
-
-                # Update comparison entry
-                for entry in model_comparison:
-                    if entry["model_name"] == best_name:
-                        entry["f1_score"] = round(f1_after, 4)
-                        prec_t = float(precision_score(y_test, y_pred_tuned, zero_division=0))
-                        rec_t = float(recall_score(y_test, y_pred_tuned, zero_division=0))
-                        acc_t = float(accuracy_score(y_test, y_pred_tuned))
-                        entry["accuracy"] = round(acc_t, 4)
-                        entry["precision"] = round(prec_t, 4)
-                        entry["recall"] = round(rec_t, 4)
-
-                logger.info(f"  Tuning done. F1: {f1_before:.4f} → {f1_after:.4f}")
-            except Exception as e:
-                logger.warning(f"  Hyperparameter tuning failed: {e}")
-        else:
-            logger.info("Stage 3: Skipping tuning (not applicable for this model type)")
-
-        # ── Predict on full dataset with best model ──
-        if self.best_model is not None:
-            fraud_proba = self.best_model.predict_proba(X_all)[:, 1]
-        else:
-            fraud_proba = np.zeros(len(df))
+        # Predict on full dataset with XGBoost
+        fraud_proba = xgb_model.predict_proba(X_all.values)[:, 1]
         df['fraud_probability'] = fraud_proba
         df['predicted_fraud'] = (fraud_proba > 0.5).astype(int)
 
-        # Feature importance (for tree models)
-        if hasattr(self.best_model, 'feature_importances_'):
-            importance = self.best_model.feature_importances_
+        # Feature importance
+        if hasattr(xgb_model, 'feature_importances_'):
+            importance = xgb_model.feature_importances_
             self.feature_importance = {
                 name: round(float(imp), 4)
                 for name, imp in sorted(
@@ -323,41 +245,22 @@ class FraudDetector:
                     key=lambda x: x[1], reverse=True
                 )
             }
-        elif hasattr(self.best_model, 'coef_'):
-            coefs = np.abs(self.best_model.coef_[0])
-            self.feature_importance = {
-                name: round(float(imp), 4)
-                for name, imp in sorted(
-                    zip(feat_names, coefs),
-                    key=lambda x: x[1], reverse=True
-                )
-            }
-        else:
-            self.feature_importance = {}
 
-        # ── Stage 4: SHAP on best model ──
+        # ── SHAP on XGBoost fraud rows only ──
         shap_summary = {}
         shap_reasons_map = {}
         try:
             import shap
-            logger.info("Stage 4: Computing SHAP values on best model...")
+            logger.info("Track A: Computing SHAP on XGBoost fraud rows...")
 
-            fraud_mask = df['fraud_probability'] > 0.5
+            fraud_mask = fraud_proba > 0.5
             X_fraud = X_all[fraud_mask]
 
             if len(X_fraud) > 2000:
                 X_fraud = X_fraud.sample(2000, random_state=42)
 
-            if best_name in ["XGBoost", "Random Forest", "Decision Tree"]:
-                explainer = shap.TreeExplainer(self.best_model)
-            else:
-                explainer = shap.LinearExplainer(self.best_model, X_train)
-
+            explainer = shap.TreeExplainer(xgb_model)
             shap_values = explainer.shap_values(X_fraud)
-
-            # Handle multi-output SHAP for RF/DT
-            if isinstance(shap_values, list):
-                shap_values = shap_values[1]  # class 1 = fraud
 
             mean_abs_shap = np.abs(shap_values).mean(axis=0)
             shap_summary = {
@@ -365,7 +268,6 @@ class FraudDetector:
                 for name, val in zip(feat_names, mean_abs_shap)
             }
 
-            # Per-row top 3 SHAP reasons
             for i, idx in enumerate(X_fraud.index):
                 row_shap = shap_values[i]
                 top_indices = np.argsort(np.abs(row_shap))[-3:][::-1]
@@ -410,38 +312,119 @@ class FraudDetector:
         total_fraud = int(df['predicted_fraud'].sum())
         total = len(df)
 
+        xgb_entry = track_a_results["XGBoost"]
+        xgb_entry["is_best"] = True
+
+        # ══════════════════════════════════════════════════════════════
+        # Track B: Background comparison — launch in threads
+        # ══════════════════════════════════════════════════════════════
+        background_results = {
+            "XGBoost": dict(xgb_entry)  # copy, already done
+        }
+
+        # Initialize job store entry
+        job_store[job_id] = {
+            "comparison": {
+                "status": "processing",
+                "models": [
+                    dict(xgb_entry),
+                    {"model_name": "Random Forest", "status": "processing", "why_used": WHY_USED["Random Forest"]},
+                    {"model_name": "Logistic Regression", "status": "processing", "why_used": WHY_USED["Logistic Regression"]},
+                    {"model_name": "Decision Tree", "status": "processing", "why_used": WHY_USED["Decision Tree"]},
+                ],
+                "best_model_name": "XGBoost",
+                "best_model_f1": xgb_entry["f1_score"],
+                "note": "XGBoost results used for dashboard. Other models training in background...",
+            }
+        }
+
+        comparison_models = {
+            "Random Forest": RandomForestClassifier(
+                n_estimators=200, max_depth=6, class_weight='balanced',
+                random_state=42, n_jobs=-1,
+            ),
+            "Logistic Regression": LogisticRegression(
+                class_weight='balanced', max_iter=1000, random_state=42,
+            ),
+            "Decision Tree": DecisionTreeClassifier(
+                max_depth=5, class_weight='balanced', random_state=42,
+            ),
+        }
+
+        def run_background_comparison():
+            """Train remaining 3 models in parallel threads."""
+            try:
+                with ThreadPoolExecutor(max_workers=3) as executor:
+                    futures = {
+                        name: executor.submit(
+                            run_single_model, name, model,
+                            X_train_np, X_test_np, y_train_np, y_test_np,
+                            background_results
+                        )
+                        for name, model in comparison_models.items()
+                    }
+                    for future in futures.values():
+                        future.result()
+
+                # Determine overall best across all 4
+                completed = {
+                    k: v for k, v in background_results.items()
+                    if v.get("status") == "complete"
+                }
+                if completed:
+                    best_name = max(completed, key=lambda k: completed[k]["f1_score"])
+                    for name in completed:
+                        completed[name]["is_best"] = (name == best_name)
+
+                    job_store[job_id]["comparison"] = {
+                        "status": "complete",
+                        "models": list(background_results.values()),
+                        "best_model_name": best_name,
+                        "best_model_f1": completed[best_name]["f1_score"],
+                        "note": (
+                            f"XGBoost was used for dashboard predictions. "
+                            f"Overall best model: {best_name} "
+                            f"(F1={completed[best_name]['f1_score']})."
+                        ),
+                    }
+                    logger.info(f"Track B: All comparisons done. Best overall: {best_name}")
+                else:
+                    job_store[job_id]["comparison"]["status"] = "complete"
+                    logger.warning("Track B: No models completed successfully")
+            except Exception as e:
+                logger.error(f"Track B failed: {e}")
+                job_store[job_id]["comparison"]["status"] = "complete"
+
+        # Launch background thread — does NOT block the response
+        bg_thread = threading.Thread(target=run_background_comparison, daemon=True)
+        bg_thread.start()
+        logger.info("Track B: Background comparison launched (3 models)")
+
+        # ── Build dashboard result (Track A only) ──
         result = {
             "fraud_count": total_fraud,
             "fraud_rate": round(total_fraud / max(total, 1) * 100, 2),
             "total_processed": total,
-            "precision": round(model_comparison[0]["precision"] if model_comparison else 0.0, 4),
-            "recall": round(model_comparison[0]["recall"] if model_comparison else 0.0, 4),
-            "f1_score": round(best_f1, 4),
+            "precision": xgb_entry["precision"],
+            "recall": xgb_entry["recall"],
+            "f1_score": xgb_entry["f1_score"],
             "fraud_rows": fraud_rows,
             "feature_importance": self.feature_importance,
             "shap_summary": shap_summary,
-            "model_comparison": model_comparison,
-            "best_model_name": best_name,
-            "best_model_f1": round(best_f1, 4),
-            "tuned_model_metrics": tuned_metrics,
+            "model_comparison": [dict(xgb_entry)],
+            "best_model_name": "XGBoost",
+            "best_model_f1": xgb_entry["f1_score"],
+            "tuned_model_metrics": None,
+            "job_id": job_id,
         }
 
-        # Use best model's metrics for top-level
-        for entry in model_comparison:
-            if entry["is_best"]:
-                result["precision"] = entry["precision"]
-                result["recall"] = entry["recall"]
-                result["f1_score"] = entry["f1_score"]
-                break
-
-        logger.info(f"Fraud detection complete. {total_fraud}/{total} flagged. Best: {best_name}")
+        logger.info(f"Track A complete. {total_fraud}/{total} flagged. Dashboard ready.")
         return result
 
     def predict_single(self, row_dict: Dict[str, Any]) -> Dict[str, Any]:
         """
         Predict fraud probability for a single transaction.
-
-        Uses the best model from the last detect() call.
+        Uses the XGBoost model from the last detect() call.
 
         Args:
             row_dict: Dict with transaction field values.
@@ -465,7 +448,6 @@ class FraudDetector:
             from pipeline.features import FeatureEngineer
 
             single_df = pd.DataFrame([row_dict])
-
             cleaner = DataCleaner()
             single_df, _ = cleaner.clean(single_df)
 
@@ -478,39 +460,25 @@ class FraudDetector:
                     )
 
             single_df = fe.engineer_features(single_df)
-
             X = self._prepare_features(single_df, MODEL_FEATURES)
             proba = float(self.best_model.predict_proba(X)[:, 1][0])
             is_fraud = proba > 0.5
 
             if proba < 0.3:
-                confidence = "Low"
-            elif proba <= 0.7:
-                confidence = "Medium"
-            else:
-                confidence = "High"
-
-            if proba < 0.3:
-                risk_level = "Low"
+                confidence, risk_level = "Low", "Low"
             elif proba < 0.5:
-                risk_level = "Medium"
+                confidence, risk_level = "Medium", "Medium"
             elif proba < 0.8:
-                risk_level = "High"
+                confidence, risk_level = "High", "High"
             else:
-                risk_level = "Critical"
+                confidence, risk_level = "High", "Critical"
 
-            # SHAP reasons
             reasons = []
             try:
                 import shap
-                feat_names = X.columns.tolist()
-                if self.best_model_name in ["XGBoost", "Random Forest", "Decision Tree"]:
-                    explainer = shap.TreeExplainer(self.best_model)
-                else:
-                    explainer = shap.LinearExplainer(self.best_model, self._X_train)
+                explainer = shap.TreeExplainer(self.best_model)
                 sv = explainer.shap_values(X)
-                if isinstance(sv, list):
-                    sv = sv[1]
+                feat_names = X.columns.tolist()
                 top_indices = np.argsort(np.abs(sv[0]))[-3:][::-1]
                 for ti in top_indices:
                     val = float(sv[0][ti])

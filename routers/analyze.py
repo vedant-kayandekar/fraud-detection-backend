@@ -1,13 +1,14 @@
 """
-Analyze Router — POST /api/v1/analyze
+Analyze Router — POST /api/v1/analyze + GET /api/v1/comparison/{job_id}
 
-Accepts CSV upload, runs full fraud detection pipeline,
-and returns complete dashboard JSON.
+Track A: CSV → clean → features → XGBoost → SHAP → dashboard JSON (fast).
+Track B: Background thread trains RF, LR, DT → polls via comparison endpoint.
 """
 
 import io
 import time
 import math
+import uuid
 import logging
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
@@ -17,22 +18,18 @@ from typing import Optional
 
 from pipeline.cleaner import DataCleaner
 from pipeline.features import FeatureEngineer
-from pipeline.model import FraudDetector
+from pipeline.model import FraudDetector, job_store
 from pipeline.analyzer import EDAAnalyzer
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# Shared model cache — used by predict_single after an analyze call
+# Shared model cache — used by predict_single after analyze
 _detector: Optional[FraudDetector] = None
 
 
 def get_detector(fresh: bool = False) -> FraudDetector:
-    """Get or create a FraudDetector instance.
-    
-    Args:
-        fresh: If True, always create a new instance (used for new analysis).
-    """
+    """Get or create a FraudDetector instance."""
     global _detector
     if fresh or _detector is None:
         _detector = FraudDetector()
@@ -74,39 +71,27 @@ async def analyze_csv(
     """
     Full fraud detection pipeline endpoint.
 
-    Accepts: multipart/form-data with CSV file + optional user_id.
-    Runs: cleaner → features → model (4 models) → analyzer.
-    Returns: complete dashboard JSON with model comparison.
-
-    Args:
-        file: Uploaded CSV file.
-        user_id: Optional authenticated user ID for saving to history.
-
-    Returns:
-        JSONResponse with data_quality, summary_stats, fraud_results
-        (including model_comparison), chart_data, filename, total_rows.
-
-    Raises:
-        HTTPException: 400 if not CSV, 422 if parsing fails, 500 on error.
+    Returns dashboard JSON immediately after XGBoost (Track A).
+    Background models (Track B) accessible via GET /comparison/{job_id}.
     """
     start_time = time.time()
 
-    # Validate file type
     if not file.filename or not file.filename.lower().endswith('.csv'):
         raise HTTPException(status_code=400, detail="Only CSV files are accepted.")
 
-    # Check file size (50MB limit)
     contents = await file.read()
     if len(contents) > 50 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="File size exceeds 50MB limit.")
 
     try:
-        # Parse CSV
         df = pd.read_csv(io.BytesIO(contents))
         if df.empty:
             raise HTTPException(status_code=422, detail="CSV file is empty.")
 
         logger.info(f"Processing {file.filename}: {len(df)} rows, {len(df.columns)} columns")
+
+        # Generate unique job ID for this analysis
+        job_id = str(uuid.uuid4())[:12]
 
         # Step 1: Clean
         cleaner = DataCleaner()
@@ -116,9 +101,9 @@ async def analyze_csv(
         fe = FeatureEngineer()
         df_features = fe.engineer_features(df_clean)
 
-        # Step 3: Fraud detection (multi-model)
+        # Step 3: Fraud detection (Track A: XGBoost fast, Track B: background)
         detector = get_detector(fresh=True)
-        fraud_results = detector.detect(df_features)
+        fraud_results = detector.detect(df_features, job_id=job_id)
 
         # Step 4: EDA
         analyzer = EDAAnalyzer()
@@ -126,9 +111,9 @@ async def analyze_csv(
         chart_data = analyzer.get_chart_data(df_clean, df_features)
 
         elapsed = round(time.time() - start_time, 2)
-        logger.info(f"Pipeline complete in {elapsed}s")
+        logger.info(f"Track A pipeline complete in {elapsed}s")
 
-        # Calculate data quality score
+        # Data quality score
         total = quality_report['total_rows']
         issues = (
             quality_report['amount_parse_failures'] +
@@ -149,6 +134,7 @@ async def analyze_csv(
             "filename": file.filename,
             "total_rows": total,
             "processing_time_seconds": elapsed,
+            "job_id": job_id,
         }
 
         # Save to Supabase if user_id provided
@@ -174,3 +160,18 @@ async def analyze_csv(
     except Exception as e:
         logger.error(f"Analysis failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+
+
+@router.get("/comparison/{job_id}")
+async def get_comparison(job_id: str):
+    """
+    Get background model comparison results for a given job.
+
+    Frontend polls this every 3 seconds until status == 'complete'.
+    Returns immediately — never blocks.
+    """
+    if job_id not in job_store:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    comparison = job_store[job_id].get("comparison", {"status": "processing", "models": []})
+    return JSONResponse(content=sanitize_for_json(comparison))
