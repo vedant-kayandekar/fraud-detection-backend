@@ -23,14 +23,18 @@ from pipeline.analyzer import EDAAnalyzer
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# Shared model cache (persists between requests)
+# Shared model cache — used by predict_single after an analyze call
 _detector: Optional[FraudDetector] = None
 
 
-def get_detector() -> FraudDetector:
-    """Get or create the shared FraudDetector instance."""
+def get_detector(fresh: bool = False) -> FraudDetector:
+    """Get or create a FraudDetector instance.
+    
+    Args:
+        fresh: If True, always create a new instance (used for new analysis).
+    """
     global _detector
-    if _detector is None:
+    if fresh or _detector is None:
         _detector = FraudDetector()
     return _detector
 
@@ -38,7 +42,7 @@ def get_detector() -> FraudDetector:
 def sanitize_for_json(obj):
     """
     Recursively sanitize a Python object for JSON serialization.
-    Replaces NaN, inf, -inf with None.
+    Replaces NaN, inf, -inf with None. Converts numpy types.
     """
     if isinstance(obj, dict):
         return {k: sanitize_for_json(v) for k, v in obj.items()}
@@ -71,16 +75,16 @@ async def analyze_csv(
     Full fraud detection pipeline endpoint.
 
     Accepts: multipart/form-data with CSV file + optional user_id.
-    Runs: cleaner → features → model → analyzer.
-    Returns: complete dashboard JSON.
+    Runs: cleaner → features → model (4 models) → analyzer.
+    Returns: complete dashboard JSON with model comparison.
 
     Args:
         file: Uploaded CSV file.
         user_id: Optional authenticated user ID for saving to history.
 
     Returns:
-        AnalysisResponse dict with data_quality, summary_stats,
-        fraud_results, chart_data, filename, total_rows.
+        JSONResponse with data_quality, summary_stats, fraud_results
+        (including model_comparison), chart_data, filename, total_rows.
 
     Raises:
         HTTPException: 400 if not CSV, 422 if parsing fails, 500 on error.
@@ -112,8 +116,8 @@ async def analyze_csv(
         fe = FeatureEngineer()
         df_features = fe.engineer_features(df_clean)
 
-        # Step 3: Fraud detection
-        detector = get_detector()
+        # Step 3: Fraud detection (multi-model)
+        detector = get_detector(fresh=True)
         fraud_results = detector.detect(df_features)
 
         # Step 4: EDA
@@ -158,7 +162,7 @@ async def analyze_csv(
                     fraud_count=fraud_results['fraud_count'],
                     fraud_rate=fraud_results['fraud_rate'],
                     f1=fraud_results['f1_score'],
-                    result_json=response,
+                    result_json=sanitize_for_json(response),
                 )
             except Exception as e:
                 logger.warning(f"Failed to save to Supabase: {e}")
