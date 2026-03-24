@@ -184,8 +184,7 @@ class FraudDetector:
         self.iso_model = IsolationForest(
             contamination=0.107,
             random_state=42,
-            n_estimators=150,
-            n_jobs=-1
+            n_estimators=100,
         )
         iso_labels = self.iso_model.fit_predict(X_iso)
         df['pseudo_fraud'] = (iso_labels == -1).astype(int)
@@ -216,14 +215,14 @@ class FraudDetector:
         import xgboost as xgb
 
         xgb_model = xgb.XGBClassifier(
-            n_estimators=200,
+            n_estimators=100,
             max_depth=4,
             learning_rate=0.1,
             scale_pos_weight=scale_pos,
             use_label_encoder=False,
             eval_metric='logloss',
             random_state=42,
-            n_jobs=-1,
+            n_jobs=1,
         )
 
         track_a_results = {}
@@ -261,8 +260,8 @@ class FraudDetector:
             fraud_mask = df['predicted_fraud'] == 1
             X_fraud = X_all[fraud_mask]
 
-            if len(X_fraud) > 2000:
-                X_fraud = X_fraud.sample(2000, random_state=42)
+            if len(X_fraud) > 200:
+                X_fraud = X_fraud.sample(200, random_state=42)
 
             explainer = shap.TreeExplainer(xgb_model)
             shap_values = explainer.shap_values(X_fraud)
@@ -345,8 +344,8 @@ class FraudDetector:
 
         comparison_models = {
             "Random Forest": RandomForestClassifier(
-                n_estimators=200, max_depth=6, class_weight='balanced',
-                random_state=42, n_jobs=-1,
+                n_estimators=100, max_depth=6, class_weight='balanced',
+                random_state=42, n_jobs=1,
             ),
             "Logistic Regression": LogisticRegression(
                 class_weight='balanced', max_iter=1000, random_state=42,
@@ -359,7 +358,7 @@ class FraudDetector:
         def run_background_comparison():
             """Train remaining 3 models in parallel threads."""
             try:
-                with ThreadPoolExecutor(max_workers=3) as executor:
+                with ThreadPoolExecutor(max_workers=1) as executor:
                     futures = {
                         name: executor.submit(
                             run_single_model, name, model,

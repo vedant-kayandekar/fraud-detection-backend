@@ -111,12 +111,29 @@ class EDAAnalyzer:
             fraud_by_device_type, fraud_by_city, amount_distribution,
             daily_fraud_trend, top_fraud_users.
         """
-        df = df_with_fraud.copy()
+        # For large datasets, sample down to avoid timeout on constrained servers
+        MAX_CHART_ROWS = 10000
+        if len(df_with_fraud) > MAX_CHART_ROWS:
+            logger.info(f"Sampling {MAX_CHART_ROWS} rows from {len(df_with_fraud)} for chart generation")
+            # Stratified sample to preserve fraud ratio
+            if 'predicted_fraud' in df_with_fraud.columns:
+                fraud_df = df_with_fraud[df_with_fraud['predicted_fraud'] == 1]
+                normal_df = df_with_fraud[df_with_fraud['predicted_fraud'] == 0]
+                fraud_sample_n = min(len(fraud_df), MAX_CHART_ROWS // 2)
+                normal_sample_n = min(len(normal_df), MAX_CHART_ROWS - fraud_sample_n)
+                df = pd.concat([
+                    fraud_df.sample(fraud_sample_n, random_state=42),
+                    normal_df.sample(normal_sample_n, random_state=42)
+                ])
+            else:
+                df = df_with_fraud.sample(MAX_CHART_ROWS, random_state=42)
+        else:
+            df = df_with_fraud.copy()
         charts = {}
 
         # ── Fraud by category ──
         if 'clean_category' in df.columns and 'predicted_fraud' in df.columns:
-            cat_fraud = df.groupby('clean_category').agg(
+            cat_fraud = df.groupby('clean_category', observed=True).agg(
                 fraud_count=('predicted_fraud', 'sum'),
                 total=('predicted_fraud', 'count')
             ).reset_index()
@@ -155,7 +172,7 @@ class EDAAnalyzer:
 
         # ── Fraud by payment method ──
         if 'clean_payment_method' in df.columns and 'predicted_fraud' in df.columns:
-            pay_fraud = df.groupby('clean_payment_method').agg(
+            pay_fraud = df.groupby('clean_payment_method', observed=True).agg(
                 fraud_count=('predicted_fraud', 'sum'),
                 total=('predicted_fraud', 'count')
             ).reset_index()
@@ -172,7 +189,7 @@ class EDAAnalyzer:
 
         # ── Fraud by device type ──
         if 'clean_device_type' in df.columns and 'predicted_fraud' in df.columns:
-            dev_fraud = df.groupby('clean_device_type').agg(
+            dev_fraud = df.groupby('clean_device_type', observed=True).agg(
                 fraud_count=('predicted_fraud', 'sum'),
                 total=('predicted_fraud', 'count')
             ).reset_index()
@@ -189,7 +206,7 @@ class EDAAnalyzer:
 
         # ── Fraud by city ──
         if 'user_city_canonical' in df.columns and 'predicted_fraud' in df.columns:
-            city_fraud = df.groupby('user_city_canonical').agg(
+            city_fraud = df.groupby('user_city_canonical', observed=True).agg(
                 fraud_count=('predicted_fraud', 'sum'),
                 total=('predicted_fraud', 'count')
             ).reset_index()

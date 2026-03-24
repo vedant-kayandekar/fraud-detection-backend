@@ -171,7 +171,12 @@ async def get_comparison(job_id: str):
     Returns immediately — never blocks.
     """
     if job_id not in job_store:
-        raise HTTPException(status_code=404, detail="Job not found")
+        # Job may have been lost after server restart — return graceful status
+        return JSONResponse(content={
+            "status": "expired",
+            "models": [],
+            "note": "Job data expired. This can happen if the server restarted. Dashboard results are unaffected."
+        })
 
     comparison = job_store[job_id].get("comparison", {"status": "processing", "models": []})
     return JSONResponse(content=sanitize_for_json(comparison))
