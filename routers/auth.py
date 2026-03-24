@@ -91,4 +91,7 @@ async def login(creds: AuthCredentials):
             raise HTTPException(status_code=401, detail="Invalid email or password")
     except Exception as e:
         logger.error(f"Login error: {e}")
+        error_msg = str(e).lower()
+        if "timeout" in error_msg or "timed out" in error_msg:
+            raise HTTPException(status_code=504, detail="Authentication server timed out. Please try again.")
         raise HTTPException(status_code=401, detail="Invalid email or password")

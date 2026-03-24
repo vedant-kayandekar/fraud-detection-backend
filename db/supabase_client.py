@@ -37,8 +37,12 @@ def get_supabase():
         return None
 
     try:
-        from supabase import create_client
-        _supabase_client = create_client(url, key)
+        from supabase import create_client, ClientOptions
+
+        # Increase DB query timeout to 60s (free-tier can be slow)
+        options = ClientOptions(postgrest_client_timeout=60)
+        
+        _supabase_client = create_client(url, key, options=options)
         logger.info("Supabase client initialized successfully.")
         return _supabase_client
     except Exception as e:

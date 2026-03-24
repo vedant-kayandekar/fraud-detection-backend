@@ -1,34 +1,49 @@
 """
-History Router — GET /api/v1/history/{user_id}
+History Router — GET /api/v1/history
 
 Returns past analysis history from Supabase for the authenticated user.
+Returns empty list for guest/unauthenticated users.
 """
 
 import logging
 from fastapi import APIRouter, HTTPException, Depends
-from typing import List
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from typing import List, Optional
 
 from db.supabase_client import get_history
-from routers.auth import get_current_user
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+_security = HTTPBearer(auto_error=False)
+
+
+async def _get_optional_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(_security)) -> Optional[str]:
+    """Return user_id if valid token, else None."""
+    if credentials is None:
+        return None
+    try:
+        from db.supabase_client import get_supabase
+        client = get_supabase()
+        if not client:
+            return None
+        res = client.auth.get_user(credentials.credentials)
+        if res and res.user:
+            return res.user.id
+    except Exception:
+        pass
+    return None
+
 
 @router.get("/history")
-async def get_user_history(user_id: str = Depends(get_current_user)):
+async def get_user_history(user_id: Optional[str] = Depends(_get_optional_user)):
     """
     Get analysis history for a user.
-
-    Args:
-        user_id: UUID of the authenticated user.
-
-    Returns:
-        List of history entries with filename, date, counts, etc.
-
-    Raises:
-        HTTPException: 500 on database error.
+    Returns empty list if not authenticated (guest mode).
     """
+    if not user_id:
+        return {"history": []}
+
     try:
         history = get_history(user_id)
         return {"history": history}

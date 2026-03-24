@@ -10,8 +10,9 @@ import time
 import math
 import uuid
 import logging
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, Request
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import pandas as pd
 import numpy as np
 from typing import Optional
@@ -20,10 +21,29 @@ from pipeline.cleaner import DataCleaner
 from pipeline.features import FeatureEngineer
 from pipeline.model import FraudDetector, job_store
 from pipeline.analyzer import EDAAnalyzer
-from routers.auth import get_current_user
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# Optional auth — allows guest mode for presentations
+_security = HTTPBearer(auto_error=False)
+
+
+async def get_optional_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(_security)) -> Optional[str]:
+    """Return user_id if a valid token is provided, otherwise None (guest mode)."""
+    if credentials is None:
+        return None
+    try:
+        from db.supabase_client import get_supabase
+        client = get_supabase()
+        if not client:
+            return "guest-user"
+        res = client.auth.get_user(credentials.credentials)
+        if res and res.user:
+            return res.user.id
+    except Exception:
+        pass
+    return "guest-user"
 
 # Shared model cache — used by predict_single after analyze
 _detector: Optional[FraudDetector] = None
@@ -67,7 +87,7 @@ def sanitize_for_json(obj):
 @router.post("/analyze")
 async def analyze_csv(
     file: UploadFile = File(...),
-    user_id: str = Depends(get_current_user)
+    user_id: Optional[str] = Depends(get_optional_user)
 ):
     """
     Full fraud detection pipeline endpoint.
@@ -138,20 +158,21 @@ async def analyze_csv(
             "job_id": job_id,
         }
 
-        # Save to Supabase (user_id is guaranteed by get_current_user)
-        try:
-            from db.supabase_client import save_analysis
-            save_analysis(
-                user_id=user_id,
-                filename=file.filename,
-                total_rows=total,
-                fraud_count=fraud_results['fraud_count'],
-                fraud_rate=fraud_results['fraud_rate'],
-                f1=fraud_results['f1_score'],
-                result_json=sanitize_for_json(response),
-            )
-        except Exception as e:
-            logger.warning(f"Failed to save to Supabase: {e}")
+        # Save to Supabase only if authenticated (skip for guest mode)
+        if user_id and user_id != "guest-user":
+            try:
+                from db.supabase_client import save_analysis
+                save_analysis(
+                    user_id=user_id,
+                    filename=file.filename,
+                    total_rows=total,
+                    fraud_count=fraud_results['fraud_count'],
+                    fraud_rate=fraud_results['fraud_rate'],
+                    f1=fraud_results['f1_score'],
+                    result_json=sanitize_for_json(response),
+                )
+            except Exception as e:
+                logger.warning(f"Failed to save to Supabase: {e}")
 
         return JSONResponse(content=sanitize_for_json(response))
 
