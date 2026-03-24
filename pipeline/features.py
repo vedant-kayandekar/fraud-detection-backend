@@ -292,17 +292,59 @@ class FeatureEngineer:
             df['device_multi_user'] = 0
 
         # ═══════════════════════════════════════════════════════════════
+        # 6 New FinTech Fraud Features (Optimization Pass)
+        # ═══════════════════════════════════════════════════════════════
+
+        # ── 22. Pending status (transaction never settled — fraud indicator) ──
+        df['is_pending_status'] = (df['clean_status'] == 'pending').astype(int)
+
+        # ── 23. Duplicate transaction ID (replay attack indicator) ──
+        if 'transaction_id' in df.columns:
+            dup_mask = df['transaction_id'].duplicated(keep=False)
+            df['is_duplicate_txn_id'] = dup_mask.astype(int)
+        else:
+            df['is_duplicate_txn_id'] = 0
+
+        # ── 24. Amount exceeds balance (overdraft fraud) ──
+        df['amount_exceeds_balance'] = (
+            (df['clean_amount'].fillna(0) > df['clean_balance'].fillna(0)) &
+            (df['clean_balance'].fillna(0) > 0)
+        ).astype(int)
+
+        # ── 25. Round amount (₹5000, ₹10000 — structured fraud) ──
+        amt_val = df['clean_amount'].fillna(0)
+        df['is_round_amount'] = (
+            (amt_val > 0) & (amt_val % 1000 == 0)
+        ).astype(int)
+
+        # ── 26. ATM + high amount (ATM fraud pattern) ──
+        if 'clean_device_type' in df.columns:
+            df['is_atm_high_amount'] = (
+                (df['clean_device_type'].astype(str).str.lower() == 'atm') &
+                (df['clean_amount'].fillna(0) > 5000)
+            ).astype(int)
+        else:
+            df['is_atm_high_amount'] = 0
+
+        # ── 27. Any failed transaction (overall failure flag) ──
+        df['is_failed_any'] = (df['clean_status'] == 'failed').astype(int)
+
+        # ═══════════════════════════════════════════════════════════════
         # 5 Combined Features (Improvement Pass)
         # ═══════════════════════════════════════════════════════════════
 
         # ── Combined 1: Composite risk score (weighted binary flags) ──
         df['risk_score_composite'] = (
-            df['is_zero_balance_success'].astype(int) * 3 +
-            df['is_new_device_prefix'].astype(int) * 2 +
-            df['is_international'].astype(int) * 2 +
+            df['is_zero_balance_success'].astype(int) * 2 +
+            df['is_new_device_prefix'].astype(int) * 1 +
+            df['is_international'].astype(int) * 1 +
             df['is_micro_transaction'].astype(int) * 1 +
             df['is_night'].astype(int) * 1 +
-            df['is_cnp_device'].astype(int) * 2
+            df['is_cnp_device'].astype(int) * 1 +
+            df['is_pending_status'].astype(int) * 1 +
+            df['is_duplicate_txn_id'].astype(int) * 1 +
+            df['amount_exceeds_balance'].astype(int) * 1 +
+            df['is_failed_any'].astype(int) * 1
         )
 
         # ── Combined 2: Amount as proportion of account balance ──

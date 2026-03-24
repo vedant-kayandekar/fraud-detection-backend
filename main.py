@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
-from routers import analyze, predict, history
+from routers import analyze, predict, history, auth
 
 # Load environment variables
 load_dotenv()
@@ -51,6 +51,7 @@ app.add_middleware(
 )
 
 # Mount routers
+app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
 app.include_router(analyze.router, prefix="/api/v1", tags=["analyze"])
 app.include_router(predict.router, prefix="/api/v1", tags=["predict"])
 app.include_router(history.router, prefix="/api/v1", tags=["history"])

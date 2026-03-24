@@ -5,17 +5,18 @@ Returns past analysis history from Supabase for the authenticated user.
 """
 
 import logging
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from typing import List
 
 from db.supabase_client import get_history
+from routers.auth import get_current_user
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-@router.get("/history/{user_id}")
-async def get_user_history(user_id: str):
+@router.get("/history")
+async def get_user_history(user_id: str = Depends(get_current_user)):
     """
     Get analysis history for a user.
 

@@ -10,7 +10,7 @@ import time
 import math
 import uuid
 import logging
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
 from fastapi.responses import JSONResponse
 import pandas as pd
 import numpy as np
@@ -20,6 +20,7 @@ from pipeline.cleaner import DataCleaner
 from pipeline.features import FeatureEngineer
 from pipeline.model import FraudDetector, job_store
 from pipeline.analyzer import EDAAnalyzer
+from routers.auth import get_current_user
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -66,7 +67,7 @@ def sanitize_for_json(obj):
 @router.post("/analyze")
 async def analyze_csv(
     file: UploadFile = File(...),
-    user_id: Optional[str] = Form(None)
+    user_id: str = Depends(get_current_user)
 ):
     """
     Full fraud detection pipeline endpoint.
@@ -137,21 +138,20 @@ async def analyze_csv(
             "job_id": job_id,
         }
 
-        # Save to Supabase if user_id provided
-        if user_id:
-            try:
-                from db.supabase_client import save_analysis
-                save_analysis(
-                    user_id=user_id,
-                    filename=file.filename,
-                    total_rows=total,
-                    fraud_count=fraud_results['fraud_count'],
-                    fraud_rate=fraud_results['fraud_rate'],
-                    f1=fraud_results['f1_score'],
-                    result_json=sanitize_for_json(response),
-                )
-            except Exception as e:
-                logger.warning(f"Failed to save to Supabase: {e}")
+        # Save to Supabase (user_id is guaranteed by get_current_user)
+        try:
+            from db.supabase_client import save_analysis
+            save_analysis(
+                user_id=user_id,
+                filename=file.filename,
+                total_rows=total,
+                fraud_count=fraud_results['fraud_count'],
+                fraud_rate=fraud_results['fraud_rate'],
+                f1=fraud_results['f1_score'],
+                result_json=sanitize_for_json(response),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to save to Supabase: {e}")
 
         return JSONResponse(content=sanitize_for_json(response))
 

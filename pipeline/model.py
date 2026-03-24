@@ -30,6 +30,7 @@ IF_FEATURES = [
     'is_zero_balance_success', 'is_micro_transaction',
     'is_new_device_prefix', 'is_cnp_device', 'is_location_mismatch',
     'is_international', 'user_txn_velocity_1hr', 'amount_vs_user_avg_ratio',
+    'is_pending_status', 'is_duplicate_txn_id', 'amount_exceeds_balance',
 ]
 
 # All engineered features used by supervised models
@@ -42,6 +43,8 @@ MODEL_FEATURES = [
     'is_new_device_prefix', 'is_cnp_device', 'device_is_new_for_user',
     'user_txn_velocity_1hr', 'user_txn_velocity_24hr',
     'is_failed_high_amount', 'device_multi_user',
+    'is_pending_status', 'is_duplicate_txn_id', 'amount_exceeds_balance',
+    'is_round_amount', 'is_atm_high_amount', 'is_failed_any',
     'risk_score_composite', 'amount_balance_ratio',
     'user_city_consistency', 'velocity_amount_product', 'night_high_spend',
 ]
@@ -179,9 +182,9 @@ class FraudDetector:
         # ── Step 1: Isolation Forest — runs once, shared by both tracks ──
         logger.info("Step 1: Running IsolationForest for pseudo-labels...")
         self.iso_model = IsolationForest(
-            contamination=0.08,
+            contamination=0.107,
             random_state=42,
-            n_estimators=100,
+            n_estimators=150,
             n_jobs=-1
         )
         iso_labels = self.iso_model.fit_predict(X_iso)
@@ -233,7 +236,7 @@ class FraudDetector:
         # Predict on full dataset with XGBoost
         fraud_proba = xgb_model.predict_proba(X_all.values)[:, 1]
         df['fraud_probability'] = fraud_proba
-        df['predicted_fraud'] = (fraud_proba > 0.5).astype(int)
+        df['predicted_fraud'] = (fraud_proba > 0.45).astype(int)
 
         # Feature importance
         if hasattr(xgb_model, 'feature_importances_'):
@@ -246,6 +249,8 @@ class FraudDetector:
                 )
             }
 
+
+
         # ── SHAP on XGBoost fraud rows only ──
         shap_summary = {}
         shap_reasons_map = {}
@@ -253,7 +258,7 @@ class FraudDetector:
             import shap
             logger.info("Track A: Computing SHAP on XGBoost fraud rows...")
 
-            fraud_mask = fraud_proba > 0.5
+            fraud_mask = df['predicted_fraud'] == 1
             X_fraud = X_all[fraud_mask]
 
             if len(X_fraud) > 2000:
